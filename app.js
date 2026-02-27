@@ -3607,17 +3607,45 @@ function stateAbbr(name) {
 }
 
 function addPinDropAddress(street, city, state, zip, lat, lng) {
-  // Check for duplicate
-  var dup = addresses.find(function(a) {
-    return a.address.toLowerCase() === street.toLowerCase() &&
-           (a.city || '').toLowerCase() === (city || '').toLowerCase();
-  });
-  if (dup) {
-    toast('⚠ That address is already in the list', 't-err');
-    openForm(dup.id);
+
+  // ── 1. Check if this address is already in the loaded addresses list ──
+  var normStreet = street.toLowerCase().trim();
+  var normCity   = (city || '').toLowerCase().trim();
+
+  var match = null;
+  for (var i = 0; i < addresses.length; i++) {
+    var a = addresses[i];
+    var aStreet = (a.address || '').toLowerCase().trim();
+    var aCity   = (a.city   || '').toLowerCase().trim();
+    // Match on street number + road (fuzzy: city optional since geocoders can differ)
+    if (aStreet === normStreet || (normCity && aStreet === normStreet && aCity === normCity)) {
+      match = a;
+      break;
+    }
+  }
+
+  // ── 2. Address exists — decide what to show ───────────────
+  if (match) {
+    var shape = getMarkerShape(match);
+
+    if (shape === 'bolt') {
+      // Existing Zito customer — show an info card instead of the sales form
+      showActivCustomerCard(match, lat, lng);
+      return;
+    }
+
+    // Known address, not an active customer — open its sales form directly
+    toast('📍 Address found — opening form', 't-ok');
+    openForm(match.id);
+    // Pan map to the existing pin
+    if (mapObj && match.lat && match.lng) {
+      mapObj.panTo([match.lat, match.lng], { animate: true });
+      if (mapMarkers[match.id]) mapMarkers[match.id].openPopup();
+    }
     return;
   }
 
+  // ── 3. Brand-new address — create locally and append to sheet ─
   var newId = addresses.length > 0
     ? Math.max.apply(null, addresses.map(function(a) { return a.id; })) + 1
     : 0;
@@ -3647,13 +3675,68 @@ function addPinDropAddress(street, city, state, zip, lat, lng) {
   // Place the proper pending marker immediately (we already have coords)
   if (mapObj) placeMarker(newAddr);
 
-  // Write to Google Sheet
+  // Write to Google Sheet — appends a new row and saves lat/lng
   maybeWriteNewAddrToSheet(newAddr);
 
   // Open the sales form right away
   openForm(newId);
 
   toast('📍 ' + street + ' added!', 't-ok');
+}
+
+// ── Show "Active Customer" info card when a rep drops a pin on a Zito customer ──
+function showActivCustomerCard(addr, dropLat, dropLng) {
+  // Remove any existing card
+  var old = document.getElementById('active-customer-card');
+  if (old) old.remove();
+
+  var card = document.createElement('div');
+  card.id = 'active-customer-card';
+  card.innerHTML =
+    '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">' +
+      '<div style="font-size:28px;">⚡</div>' +
+      '<div>' +
+        '<div style="font-size:15px;font-weight:700;color:#e6edf3;">Active Zito Customer</div>' +
+        '<div style="font-size:11px;color:#6e7681;margin-top:2px;">This address is already a subscriber</div>' +
+      '</div>' +
+    '</div>' +
+    '<div style="background:#0d1117;border-radius:10px;padding:10px 12px;margin-bottom:12px;">' +
+      '<div style="font-size:13px;font-weight:600;color:#e6edf3;">' + (addr.address || '') + '</div>' +
+      (addr.city ? '<div style="font-size:11px;color:#6e7681;margin-top:2px;">' + addr.city + (addr.state ? ', ' + addr.state : '') + (addr.zip ? ' ' + addr.zip : '') + '</div>' : '') +
+    '</div>' +
+    '<div style="font-size:11px;color:#6e7681;margin-bottom:14px;">No action needed — move to the next door.</div>' +
+    '<button onclick="document.getElementById(\'active-customer-card\').remove()" ' +
+      'style="width:100%;padding:10px;border-radius:10px;background:#005696;color:#fff;border:none;font-size:13px;font-weight:600;cursor:pointer;">Got it</button>';
+
+  card.style.cssText = [
+    'position:fixed',
+    'bottom:80px',
+    'left:50%',
+    'transform:translateX(-50%)',
+    'width:min(320px,90vw)',
+    'background:#161b22',
+    'border:1px solid #30363d',
+    'border-radius:16px',
+    'padding:16px',
+    'z-index:10000',
+    'box-shadow:0 8px 32px rgba(0,0,0,0.6)',
+    'font-family:Syne,sans-serif',
+    'animation:slideUp .25s ease'
+  ].join(';');
+
+  document.body.appendChild(card);
+
+  // Pan to the existing pin on the map
+  if (mapObj && addr.lat && addr.lng) {
+    mapObj.panTo([addr.lat, addr.lng], { animate: true });
+    if (mapMarkers[addr.id]) mapMarkers[addr.id].openPopup();
+  }
+
+  // Auto-dismiss after 8 seconds
+  setTimeout(function() {
+    var c = document.getElementById('active-customer-card');
+    if (c) c.remove();
+  }, 8000);
 }
 
 // ──────────────────────────────────────────────────────────
