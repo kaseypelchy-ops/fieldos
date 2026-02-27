@@ -282,7 +282,9 @@ function rebuildKmlGeoJSON() {
 function fetchAddressesFromSheet() {
   var btn = document.getElementById('btn-fetch-addr');
   var st  = document.getElementById('fetch-addr-status');
+  var profileSt = document.getElementById('rep-profile-status');
   var repInput = (document.getElementById('rep-name') ? (document.getElementById('rep-name').value || '').trim() : '');
+
   if (!repInput || repInput.split(/\s+/).filter(function(p){ return p.length > 0; }).length < 2) {
     st.className = 'dz-status err';
     st.textContent = '✗ Enter your full name first (First Last).';
@@ -292,9 +294,9 @@ function fetchAddressesFromSheet() {
   btn.disabled = true;
   document.getElementById('fetch-addr-icon').textContent = '⏳';
   st.className = 'dz-status';
-  st.textContent = 'Loading addresses…';
+  st.textContent = 'Loading…';
+  if (profileSt) { profileSt.style.color = 'var(--muted)'; profileSt.textContent = ''; }
 
-  // Let the backend know this is a manager so it returns ALL territories
   var managerFlag = MANAGER_NAMES.indexOf(repInput.toLowerCase()) >= 0 ? '&isManager=true' : '';
   fetch(webhookURL + '?action=addresses&repName=' + encodeURIComponent(repInput) + managerFlag + '&_t=' + Date.now())
     .then(function(r){ return r.json(); })
@@ -303,6 +305,22 @@ function fetchAddressesFromSheet() {
       if (json.status === 'error') throw new Error(json.message || 'Server error');
 
       activeTerritory = (json.territory || '').trim();
+
+      // Populate rep profile from Reps sheet
+      if (json.repPhone) {
+        repPhone = json.repPhone;
+        try { localStorage.setItem('zito_rep_phone', repPhone); } catch(e) {}
+      }
+      if (json.repEmail) {
+        repEmail = json.repEmail;
+        try { localStorage.setItem('zito_rep_email', repEmail); } catch(e) {}
+      }
+      if (profileSt && (json.repPhone || json.repEmail)) {
+        profileSt.style.color = '#10b981';
+        profileSt.textContent = '✓ Profile loaded' +
+          (json.repPhone ? ' • ' + json.repPhone : '') +
+          (json.repEmail ? ' • ' + json.repEmail : '');
+      }
 
       addresses = json.rows.map(function(row, i) {
         var lat = (row.lat !== '' && row.lat != null) ? parseFloat(row.lat) : null;
@@ -339,6 +357,7 @@ function fetchAddressesFromSheet() {
       st.textContent = '✗ ' + (err && err.message ? err.message : 'Unable to load addresses');
       document.getElementById('fetch-addr-icon').textContent = '📋';
       btn.disabled = false;
+      if (profileSt) { profileSt.textContent = ''; }
     });
 }
 
@@ -401,11 +420,13 @@ function startPolling() {
             addr.status = newStatus;
             addr.note   = newNote;
             changed = true;
+            if (addr.lat && addr.lng) markersToRefresh.push(addr);
           }
         });
 
-        // Update list and stats if data changed (no marker refresh — pin-drop only mode)
+        // Second pass: update markers all at once after data is settled
         if (changed) {
+          markersToRefresh.forEach(function(addr) { placeMarker(addr); });
           buildList();
           updateStats();
         }
@@ -415,13 +436,12 @@ function startPolling() {
 }
 function launchApp() {
   repName = (document.getElementById('rep-name').value || '').trim();
-  repPhone = (document.getElementById('rep-phone') ? (document.getElementById('rep-phone').value || '').trim() : '');
-  repEmail = (document.getElementById('rep-email') ? (document.getElementById('rep-email').value || '').trim() : '');
+  // repPhone and repEmail are populated by fetchAddressesFromSheet from the Reps sheet
 
   try {
     localStorage.setItem('zito_rep_name', repName);
-    localStorage.setItem('zito_rep_phone', repPhone);
-    localStorage.setItem('zito_rep_email', repEmail);
+    if (repPhone) localStorage.setItem('zito_rep_phone', repPhone);
+    if (repEmail) localStorage.setItem('zito_rep_email', repEmail);
     if (!localStorage.getItem('fieldos_session_start')) {
       localStorage.setItem('fieldos_session_start', new Date().toISOString());
     }
@@ -758,11 +778,15 @@ function initMap() {
   });
   clusterGroup.addTo(mapObj);
 
-  // Pins are NOT pre-loaded — reps use pin-drop to look up addresses.
-  // addresses.forEach(function(a) { if (a.lat && a.lng) placeMarker(a); });
+  addresses.forEach(function(a) {
+    if (a.lat && a.lng) { placeMarker(a); }
+  });
 
-  // Center map on rep's GPS location if available, otherwise territory centroid
-  fitToGpsOrTerritory();
+  // Fit map to address pins if we have any, otherwise fall back to US overview.
+  // KML bounds take priority if territories were loaded.
+  if (!kmlGeoJSON || !kmlGeoJSON.features.length) {
+    fitToAddresses();
+  }
 
   wxSetRadarUI_(false);
   wxInitRadarOverlay_();
@@ -878,54 +902,14 @@ function fitToAddresses() {
     return;
   }
   if (pinned.length === 1) {
+    // Single pin — go straight to street level
     mapObj.setView([pinned[0].lat, pinned[0].lng], 17);
     return;
   }
+  // Multiple pins — fit all of them with padding, then cap zoom at 17
+  // so we don't land on a comically close view when all pins are on one street
   var bounds = L.latLngBounds(pinned.map(function(a) { return [a.lat, a.lng]; }));
   mapObj.fitBounds(bounds, { padding: [48, 48], maxZoom: 17 });
-}
-
-// Center the map on rep's GPS location (most useful), falling back to
-// territory centroid from geocoded addresses, then whole-US overview.
-function fitToGpsOrTerritory() {
-  if (!mapObj) return;
-
-  // Try GPS first — most accurate for a rep in the field
-  if (navigator.geolocation) {
-    navigator.geolocation.getCurrentPosition(
-      function(pos) {
-        mapObj.setView([pos.coords.latitude, pos.coords.longitude], 16);
-      },
-      function() {
-        // GPS denied or unavailable — fall back to territory centroid
-        fitToTerritoryCentroid();
-      },
-      { timeout: 5000, maximumAge: 60000 }
-    );
-  } else {
-    fitToTerritoryCentroid();
-  }
-}
-
-function fitToTerritoryCentroid() {
-  if (!mapObj) return;
-  // Use KML territory bounds if loaded
-  if (kmlGeoJSON && kmlGeoJSON.features && kmlGeoJSON.features.length) {
-    try {
-      var kmlLayer = L.geoJSON(kmlGeoJSON);
-      mapObj.fitBounds(kmlLayer.getBounds(), { padding: [40, 40] });
-      return;
-    } catch(e) {}
-  }
-  // Fall back to centroid of geocoded addresses (no pins shown, just centers the view)
-  var pinned = addresses.filter(function(a) { return a.lat && a.lng; });
-  if (pinned.length > 0) {
-    var avgLat = pinned.reduce(function(s, a) { return s + a.lat; }, 0) / pinned.length;
-    var avgLng = pinned.reduce(function(s, a) { return s + a.lng; }, 0) / pinned.length;
-    mapObj.setView([avgLat, avgLng], 14);
-    return;
-  }
-  mapObj.setView([39.5, -98.35], 5);
 }
 
 // Pre-warm the browser's tile cache by fetching the 8 surrounding tiles at the
@@ -1000,7 +984,7 @@ function geocodeAll() {
         if (data && data.length > 0) {
           a.lat = parseFloat(data[0].lat);
           a.lng = parseFloat(data[0].lon);
-          // Pin-drop only mode — don't place markers from geocoding
+          if (mapObj) placeMarker(a);
           saveGeocodedCoords(a);
         } else {
           failed++;
@@ -1946,8 +1930,8 @@ function confirmSignOut() {
     document.getElementById('page-app').style.display   = 'none';
     document.getElementById('page-setup').style.display = 'flex';
     document.getElementById('rep-name').value = '';
-    if (document.getElementById('rep-phone')) document.getElementById('rep-phone').value = '';
-    if (document.getElementById('rep-email')) document.getElementById('rep-email').value = '';
+    repPhone = '';
+    repEmail = '';
     try { localStorage.removeItem('zito_rep_name'); localStorage.removeItem('zito_rep_phone'); localStorage.removeItem('zito_rep_email'); } catch(e) {}
     document.getElementById('launch-btn').disabled = true;
     document.getElementById('fetch-addr-status').textContent = '';
@@ -1962,9 +1946,10 @@ function restoreRepProfile() {
     var n = localStorage.getItem('zito_rep_name')  || '';
     var p = localStorage.getItem('zito_rep_phone') || '';
     var e = localStorage.getItem('zito_rep_email') || '';
-    if (n && document.getElementById('rep-name'))  document.getElementById('rep-name').value  = n;
-    if (document.getElementById('rep-phone')) document.getElementById('rep-phone').value = p;
-    if (document.getElementById('rep-email')) document.getElementById('rep-email').value = e;
+    if (n && document.getElementById('rep-name')) document.getElementById('rep-name').value = n;
+    // Restore cached phone/email (populated from sheet on last session)
+    if (p) repPhone = p;
+    if (e) repEmail = e;
   } catch(err) {}
 }
 
@@ -2020,9 +2005,50 @@ function emailCustomerOffer(pkgKey) {
 }
 
 function refreshMapMarkers() {
-  // Map is pin-drop only — bulk address pins are not rendered.
-  // Pins appear only when a rep drops one via handleMapPinDrop.
+  if (!mapObj) return;
+
+  // Clear all markers from the cluster group in one shot (much faster than
+  // removing them one at a time from the map directly)
+  if (clusterGroup) {
+    clusterGroup.clearLayers();
+  } else {
+    Object.keys(mapMarkers).forEach(function(k){
+      try { mapObj.removeLayer(mapMarkers[k]); } catch(e) {}
+    });
+  }
+  mapMarkers = {};
+
+  // Batch-add all markers to the cluster group at once.
+  // L.markerClusterGroup.addLayers() is far faster than calling
+  // addLayer() in a loop — it does a single internal reindex.
+  var toAdd = [];
+  (addresses || []).forEach(function(a){
+    if (!a || a.lat == null || a.lng == null) return;
+    var color  = getMarkerColor(a);
+    var shape  = getMarkerShape(a);
+    var html   = markerHTML(color, shape);
+    var size   = shape === 'house' ? [26,26] : shape === 'bolt' ? [20,28] : [16,16];
+    var anchor = shape === 'house' ? [13,26] : shape === 'bolt' ? [10,28] : [8,8];
+    var icon   = L.divIcon({ className:'', html: html, iconSize: size, iconAnchor: anchor });
+    var m      = L.marker([a.lat, a.lng], { icon: icon });
+    var pid    = a.id;
+    m.bindPopup(function() {
+      var shape2  = getMarkerShape(a);
+      var btnHTML = shape2 === 'bolt'
+        ? '<button class="pop-open-btn pop-active-btn" onclick="openFormFromMap(' + pid + ')">⚡ View Address</button>'
+        : '<button class="pop-open-btn" onclick="openFormFromMap(' + pid + ')">Open Sales Form</button>';
+      return '<div style="font-family:Syne,sans-serif;min-width:160px">' +
+        popupHtmlForAddr(a) + btnHTML + '</div>';
+    }, { minWidth: 180 });
+    mapMarkers[a.id] = m;
+    toAdd.push(m);
+  });
+
+  if (clusterGroup) clusterGroup.addLayers(toAdd);
 }
+
+function openManagerPanel() {
+  document.getElementById('manager-modal').classList.add('open');
   switchMgrTab('team', document.querySelector('.mgr-tab'));
   refreshManagerPanel();
   mgrAutoRefresh = setInterval(refreshManagerPanel, 30000);
@@ -3573,45 +3599,17 @@ function stateAbbr(name) {
 }
 
 function addPinDropAddress(street, city, state, zip, lat, lng) {
-
-  // ── 1. Check if this address is already in the loaded addresses list ──
-  var normStreet = street.toLowerCase().trim();
-  var normCity   = (city || '').toLowerCase().trim();
-
-  var match = null;
-  for (var i = 0; i < addresses.length; i++) {
-    var a = addresses[i];
-    var aStreet = (a.address || '').toLowerCase().trim();
-    var aCity   = (a.city   || '').toLowerCase().trim();
-    // Match on street number + road (fuzzy: city optional since geocoders can differ)
-    if (aStreet === normStreet || (normCity && aStreet === normStreet && aCity === normCity)) {
-      match = a;
-      break;
-    }
-  }
-
-  // ── 2. Address exists — decide what to show ───────────────
-  if (match) {
-    var shape = getMarkerShape(match);
-
-    if (shape === 'bolt') {
-      // Existing Zito customer — show an info card instead of the sales form
-      showActivCustomerCard(match, lat, lng);
-      return;
-    }
-
-    // Known address, not an active customer — open its sales form directly
-    toast('📍 Address found — opening form', 't-ok');
-    openForm(match.id);
-    // Pan map to the existing pin
-    if (mapObj && match.lat && match.lng) {
-      mapObj.panTo([match.lat, match.lng], { animate: true });
-      if (mapMarkers[match.id]) mapMarkers[match.id].openPopup();
-    }
+  // Check for duplicate
+  var dup = addresses.find(function(a) {
+    return a.address.toLowerCase() === street.toLowerCase() &&
+           (a.city || '').toLowerCase() === (city || '').toLowerCase();
+  });
+  if (dup) {
+    toast('⚠ That address is already in the list', 't-err');
+    openForm(dup.id);
     return;
   }
 
-  // ── 3. Brand-new address — create locally and append to sheet ─
   var newId = addresses.length > 0
     ? Math.max.apply(null, addresses.map(function(a) { return a.id; })) + 1
     : 0;
@@ -3641,68 +3639,13 @@ function addPinDropAddress(street, city, state, zip, lat, lng) {
   // Place the proper pending marker immediately (we already have coords)
   if (mapObj) placeMarker(newAddr);
 
-  // Write to Google Sheet — appends a new row and saves lat/lng
+  // Write to Google Sheet
   maybeWriteNewAddrToSheet(newAddr);
 
   // Open the sales form right away
   openForm(newId);
 
   toast('📍 ' + street + ' added!', 't-ok');
-}
-
-// ── Show "Active Customer" info card when a rep drops a pin on a Zito customer ──
-function showActivCustomerCard(addr, dropLat, dropLng) {
-  // Remove any existing card
-  var old = document.getElementById('active-customer-card');
-  if (old) old.remove();
-
-  var card = document.createElement('div');
-  card.id = 'active-customer-card';
-  card.innerHTML =
-    '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">' +
-      '<div style="font-size:28px;">⚡</div>' +
-      '<div>' +
-        '<div style="font-size:15px;font-weight:700;color:#e6edf3;">Active Zito Customer</div>' +
-        '<div style="font-size:11px;color:#6e7681;margin-top:2px;">This address is already a subscriber</div>' +
-      '</div>' +
-    '</div>' +
-    '<div style="background:#0d1117;border-radius:10px;padding:10px 12px;margin-bottom:12px;">' +
-      '<div style="font-size:13px;font-weight:600;color:#e6edf3;">' + (addr.address || '') + '</div>' +
-      (addr.city ? '<div style="font-size:11px;color:#6e7681;margin-top:2px;">' + addr.city + (addr.state ? ', ' + addr.state : '') + (addr.zip ? ' ' + addr.zip : '') + '</div>' : '') +
-    '</div>' +
-    '<div style="font-size:11px;color:#6e7681;margin-bottom:14px;">No action needed — move to the next door.</div>' +
-    '<button onclick="document.getElementById(\'active-customer-card\').remove()" ' +
-      'style="width:100%;padding:10px;border-radius:10px;background:#005696;color:#fff;border:none;font-size:13px;font-weight:600;cursor:pointer;">Got it</button>';
-
-  card.style.cssText = [
-    'position:fixed',
-    'bottom:80px',
-    'left:50%',
-    'transform:translateX(-50%)',
-    'width:min(320px,90vw)',
-    'background:#161b22',
-    'border:1px solid #30363d',
-    'border-radius:16px',
-    'padding:16px',
-    'z-index:10000',
-    'box-shadow:0 8px 32px rgba(0,0,0,0.6)',
-    'font-family:Syne,sans-serif',
-    'animation:slideUp .25s ease'
-  ].join(';');
-
-  document.body.appendChild(card);
-
-  // Pan to the existing pin on the map
-  if (mapObj && addr.lat && addr.lng) {
-    mapObj.panTo([addr.lat, addr.lng], { animate: true });
-    if (mapMarkers[addr.id]) mapMarkers[addr.id].openPopup();
-  }
-
-  // Auto-dismiss after 8 seconds
-  setTimeout(function() {
-    var c = document.getElementById('active-customer-card');
-    if (c) c.remove();
-  }, 8000);
 }
 
 // ──────────────────────────────────────────────────────────
