@@ -428,13 +428,11 @@ function startPolling() {
             addr.status = newStatus;
             addr.note   = newNote;
             changed = true;
-            if (addr.lat && addr.lng) markersToRefresh.push(addr);
           }
         });
 
-        // Second pass: update markers all at once after data is settled
+        // Update list and stats if data changed (no marker refresh — pin-drop only mode)
         if (changed) {
-          markersToRefresh.forEach(function(addr) { placeMarker(addr); });
           buildList();
           updateStats();
         }
@@ -787,15 +785,11 @@ function initMap() {
   });
   clusterGroup.addTo(mapObj);
 
-  addresses.forEach(function(a) {
-    if (a.lat && a.lng) { placeMarker(a); }
-  });
+  // Pins are NOT pre-loaded — reps use pin-drop to look up addresses.
+  // addresses.forEach(function(a) { if (a.lat && a.lng) placeMarker(a); });
 
-  // Fit map to address pins if we have any, otherwise fall back to US overview.
-  // KML bounds take priority if territories were loaded.
-  if (!kmlGeoJSON || !kmlGeoJSON.features.length) {
-    fitToAddresses();
-  }
+  // Center map on rep's GPS location if available, otherwise territory centroid
+  fitToGpsOrTerritory();
 
   wxSetRadarUI_(false);
   wxInitRadarOverlay_();
@@ -911,14 +905,54 @@ function fitToAddresses() {
     return;
   }
   if (pinned.length === 1) {
-    // Single pin — go straight to street level
     mapObj.setView([pinned[0].lat, pinned[0].lng], 17);
     return;
   }
-  // Multiple pins — fit all of them with padding, then cap zoom at 17
-  // so we don't land on a comically close view when all pins are on one street
   var bounds = L.latLngBounds(pinned.map(function(a) { return [a.lat, a.lng]; }));
   mapObj.fitBounds(bounds, { padding: [48, 48], maxZoom: 17 });
+}
+
+// Center the map on rep's GPS location (most useful), falling back to
+// territory centroid from geocoded addresses, then whole-US overview.
+function fitToGpsOrTerritory() {
+  if (!mapObj) return;
+
+  // Try GPS first — most accurate for a rep in the field
+  if (navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(
+      function(pos) {
+        mapObj.setView([pos.coords.latitude, pos.coords.longitude], 16);
+      },
+      function() {
+        // GPS denied or unavailable — fall back to territory centroid
+        fitToTerritoryCentroid();
+      },
+      { timeout: 5000, maximumAge: 60000 }
+    );
+  } else {
+    fitToTerritoryCentroid();
+  }
+}
+
+function fitToTerritoryCentroid() {
+  if (!mapObj) return;
+  // Use KML territory bounds if loaded
+  if (kmlGeoJSON && kmlGeoJSON.features && kmlGeoJSON.features.length) {
+    try {
+      var kmlLayer = L.geoJSON(kmlGeoJSON);
+      mapObj.fitBounds(kmlLayer.getBounds(), { padding: [40, 40] });
+      return;
+    } catch(e) {}
+  }
+  // Fall back to centroid of geocoded addresses (no pins shown, just centers the view)
+  var pinned = addresses.filter(function(a) { return a.lat && a.lng; });
+  if (pinned.length > 0) {
+    var avgLat = pinned.reduce(function(s, a) { return s + a.lat; }, 0) / pinned.length;
+    var avgLng = pinned.reduce(function(s, a) { return s + a.lng; }, 0) / pinned.length;
+    mapObj.setView([avgLat, avgLng], 14);
+    return;
+  }
+  mapObj.setView([39.5, -98.35], 5);
 }
 
 // Pre-warm the browser's tile cache by fetching the 8 surrounding tiles at the
@@ -993,7 +1027,7 @@ function geocodeAll() {
         if (data && data.length > 0) {
           a.lat = parseFloat(data[0].lat);
           a.lng = parseFloat(data[0].lon);
-          if (mapObj) placeMarker(a);
+          // Pin-drop only mode — don't place markers from geocoding
           saveGeocodedCoords(a);
         } else {
           failed++;
@@ -2013,50 +2047,9 @@ function emailCustomerOffer(pkgKey) {
 }
 
 function refreshMapMarkers() {
-  if (!mapObj) return;
-
-  // Clear all markers from the cluster group in one shot (much faster than
-  // removing them one at a time from the map directly)
-  if (clusterGroup) {
-    clusterGroup.clearLayers();
-  } else {
-    Object.keys(mapMarkers).forEach(function(k){
-      try { mapObj.removeLayer(mapMarkers[k]); } catch(e) {}
-    });
-  }
-  mapMarkers = {};
-
-  // Batch-add all markers to the cluster group at once.
-  // L.markerClusterGroup.addLayers() is far faster than calling
-  // addLayer() in a loop — it does a single internal reindex.
-  var toAdd = [];
-  (addresses || []).forEach(function(a){
-    if (!a || a.lat == null || a.lng == null) return;
-    var color  = getMarkerColor(a);
-    var shape  = getMarkerShape(a);
-    var html   = markerHTML(color, shape);
-    var size   = shape === 'house' ? [26,26] : shape === 'bolt' ? [20,28] : [16,16];
-    var anchor = shape === 'house' ? [13,26] : shape === 'bolt' ? [10,28] : [8,8];
-    var icon   = L.divIcon({ className:'', html: html, iconSize: size, iconAnchor: anchor });
-    var m      = L.marker([a.lat, a.lng], { icon: icon });
-    var pid    = a.id;
-    m.bindPopup(function() {
-      var shape2  = getMarkerShape(a);
-      var btnHTML = shape2 === 'bolt'
-        ? '<button class="pop-open-btn pop-active-btn" onclick="openFormFromMap(' + pid + ')">⚡ View Address</button>'
-        : '<button class="pop-open-btn" onclick="openFormFromMap(' + pid + ')">Open Sales Form</button>';
-      return '<div style="font-family:Syne,sans-serif;min-width:160px">' +
-        popupHtmlForAddr(a) + btnHTML + '</div>';
-    }, { minWidth: 180 });
-    mapMarkers[a.id] = m;
-    toAdd.push(m);
-  });
-
-  if (clusterGroup) clusterGroup.addLayers(toAdd);
+  // Map is pin-drop only — bulk address pins are not rendered.
+  // Pins appear only when a rep drops one via handleMapPinDrop.
 }
-
-function openManagerPanel() {
-  document.getElementById('manager-modal').classList.add('open');
   switchMgrTab('team', document.querySelector('.mgr-tab'));
   refreshManagerPanel();
   mgrAutoRefresh = setInterval(refreshManagerPanel, 30000);
